@@ -36,7 +36,11 @@ class YouTubePreprocessor:
             min_silence_len=min_silence_len,
             silence_thresh=silence_thresh
         )
-        
+
+        # If no chunks detected, treat whole audio as a single segment
+        if not chunks:
+            return [(0, len(audio))]
+
         # Merge chunks into segments ≤ max_duration
         segments = []
         current_start, current_end = chunks[0]
@@ -90,6 +94,12 @@ class YouTubePreprocessor:
         # Create output directory
         video_output_dir = self.output_dir / channel / video_name_clean
         video_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check and skip preprocessed files
+        video_output_dir = self.output_dir / channel / video_name_clean
+        if video_output_dir.exists() and (video_output_dir / "transcript.json").exists():
+            print(f"Skipping {video_file}, already processed")
+            return 0
         
         # Convert to WAV
         input_path = self.root_dir / channel / video_file
