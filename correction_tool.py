@@ -1,4 +1,4 @@
-# correction_tool_waveform_enhanced.py
+# correction_tool_waveform_enhanced_fixed.py
 import json
 import os
 import shutil
@@ -45,7 +45,7 @@ class ProjectManager:
         self.channels = []
         self.videos = {}  # channel -> list of videos
         self.transcripts = {}  # video_path -> transcript data
-        self.modified_status = {}  # video_path -> (modified, last_modified_time)
+        self.status_tracker = {}  # video_path -> {"verified": bool, "whisper_generated": bool, "last_modified": float}
         self.load_project()
     
     def load_project(self):
@@ -64,67 +64,141 @@ class ProjectManager:
                             data = json.load(f)
                             self.transcripts[str(video_dir)] = data
                             
-                            # Check if any segment has text (modified)
-                            has_text = any(seg.get("text", "").strip() for seg in data.get("segments", []))
+                            # Check if ANY segment has manually verified text (different from Whisper's pattern)
+                            # Whisper usually generates complete sentences, while manual edits might be partial
+                            has_verified_text = False
+                            whisper_generated = False
+                            
+                            segments = data.get("segments", [])
+                            for seg in segments:
+                                text = seg.get("text", "").strip()
+                                if text:
+                                    # Check if this looks like a Whisper-generated transcript
+                                    # Whisper usually produces proper sentences with punctuation
+                                    if any(punct in text for punct in ['.', '?', '!', ',']) and len(text) > 10:
+                                        whisper_generated = True
+                                    # If text exists but doesn't look like typical Whisper output,
+                                    # or if we've specifically marked it as verified
+                                    if seg.get("verified", False) or not whisper_generated:
+                                        has_verified_text = True
+                                        break
+                            
                             mod_time = transcript_path.stat().st_mtime
-                            self.modified_status[str(video_dir)] = (has_text, mod_time)
+                            self.status_tracker[str(video_dir)] = {
+                                "verified": has_verified_text,
+                                "whisper_generated": whisper_generated,
+                                "last_modified": mod_time,
+                                "segments_verified": 0,
+                                "total_segments": len(segments)
+                            }
                     except Exception as e:
                         print(f"Error loading {transcript_path}: {e}")
     
     def get_video_info(self, video_dir):
         """Get video information for display"""
-        transcript_path = video_dir / "transcript.json"
-        if str(video_dir) in self.modified_status:
-            modified, mod_time = self.modified_status[str(video_dir)]
-            status = "✓ Modified" if modified else "○ Pending"
+        if str(video_dir) not in self.status_tracker:
+            return "○ No transcript"
+        
+        status = self.status_tracker[str(video_dir)]
+        
+        # Calculate verified segments count
+        if str(video_dir) in self.transcripts:
+            segments = self.transcripts[str(video_dir)].get("segments", [])
+            total = len(segments)
+            verified = sum(1 for seg in segments if seg.get("verified", False))
+            status["segments_verified"] = verified
+            status["total_segments"] = total
+        
+        # Determine display status
+        if status["verified"]:
+            display_status = "✓ Verified"
+            color = "green"
+        elif status["whisper_generated"]:
+            display_status = "○ Whisper Generated (Pending)"
+            color = "orange"
+        else:
+            display_status = "○ Empty"
+            color = "gray"
+        
+        # Add segment counts
+        display_status = f"{display_status} ({status['segments_verified']}/{status['total_segments']})"
+        
+        # Add modification time if verified
+        if status["verified"]:
+            mod_str = datetime.fromtimestamp(status["last_modified"]).strftime("%Y-%m-%d %H:%M")
+            display_status = f"{display_status} @ {mod_str}"
+        
+        return display_status
+    
+    def mark_verified(self, video_dir, segment_index=None):
+        """Mark a video or specific segment as manually verified"""
+        if str(video_dir) in self.status_tracker:
+            self.status_tracker[str(video_dir)]["verified"] = True
+            self.status_tracker[str(video_dir)]["last_modified"] = datetime.now().timestamp()
             
-            # Count transcribed segments
+            # Update segment verification status if specified
+            if segment_index is not None and str(video_dir) in self.transcripts:
+                segments = self.transcripts[str(video_dir)].get("segments", [])
+                if 0 <= segment_index < len(segments):
+                    segments[segment_index]["verified"] = True
+    
+    def mark_all_verified(self, video_dir):
+        """Mark all segments in a video as verified"""
+        if str(video_dir) in self.status_tracker:
+            self.status_tracker[str(video_dir)]["verified"] = True
+            self.status_tracker[str(video_dir)]["last_modified"] = datetime.now().timestamp()
+            
+            # Mark all segments as verified
             if str(video_dir) in self.transcripts:
                 segments = self.transcripts[str(video_dir)].get("segments", [])
-                total = len(segments)
-                transcribed = sum(1 for seg in segments if seg.get("text", "").strip())
-                status = f"{status} ({transcribed}/{total})"
-            
-            # Format modification time
-            if modified:
-                mod_str = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M")
-                status = f"{status} @ {mod_str}"
-            
-            return status
-        return "○ Pending"
-    
-    def mark_modified(self, video_dir):
-        """Mark a video as modified"""
-        transcript_path = video_dir / "transcript.json"
-        if transcript_path.exists():
-            mod_time = datetime.now().timestamp()
-            self.modified_status[str(video_dir)] = (True, mod_time)
+                for seg in segments:
+                    seg["verified"] = True
+                # Update verification count
+                self.status_tracker[str(video_dir)]["segments_verified"] = len(segments)
     
     def save_all(self):
-        """Save all modified transcripts"""
+        """Save all transcripts"""
         saved = 0
         for video_path_str, data in self.transcripts.items():
             video_path = Path(video_path_str)
             transcript_path = video_path / "transcript.json"
-            if self.modified_status.get(video_path_str, (False, 0))[0]:
-                try:
-                    with open(transcript_path, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
-                    saved += 1
-                except Exception as e:
-                    print(f"Error saving {transcript_path}: {e}")
+            try:
+                with open(transcript_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                saved += 1
+            except Exception as e:
+                print(f"Error saving {transcript_path}: {e}")
         return saved
     
     def export_progress_report(self):
         """Export a progress report CSV"""
         report_path = self.base_dir / "transcription_progress.csv"
-        lines = ["Channel,Video,Status,Segments Transcribed/Total,Last Modified"]
+        lines = ["Channel,Video,Status,Segments Verified/Total,Whisper Generated,Last Modified"]
         
         for channel_name, video_dirs in self.videos.items():
             for video_dir in video_dirs:
-                status = self.get_video_info(video_dir)
-                video_name = video_dir.name
-                lines.append(f'"{channel_name}","{video_name}","{status}"')
+                if str(video_dir) in self.status_tracker:
+                    status = self.status_tracker[str(video_dir)]
+                    
+                    # Determine status text
+                    if status["verified"]:
+                        status_text = "Verified"
+                    elif status["whisper_generated"]:
+                        status_text = "Whisper Generated"
+                    else:
+                        status_text = "Empty"
+                    
+                    # Format last modified
+                    if status["last_modified"]:
+                        mod_str = datetime.fromtimestamp(status["last_modified"]).strftime("%Y-%m-%d %H:%M")
+                    else:
+                        mod_str = "N/A"
+                    
+                    video_name = video_dir.name
+                    line = f'"{channel_name}","{video_name}","{status_text}",'
+                    line += f'"{status["segments_verified"]}/{status["total_segments"]}",'
+                    line += f'"{status["whisper_generated"]}","{mod_str}"'
+                    lines.append(line)
         
         with open(report_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
@@ -149,6 +223,11 @@ class WaveformCorrector:
         if "segments" not in self.data or not isinstance(self.data["segments"], list):
             raise ValueError("transcript.json must contain a 'segments' list")
 
+        # Initialize verified flag if not present
+        for seg in self.data["segments"]:
+            if "verified" not in seg:
+                seg["verified"] = False
+
         # state
         self.current_index = 0
         self.audio = None  # AudioSegment
@@ -163,6 +242,7 @@ class WaveformCorrector:
         self.wav_temp = None
         self.selection_rect = None
         self.text_modified = False
+        self.verification_status = tk.BooleanVar(value=False)
 
         # init pygame mixer for playback
         try:
@@ -172,7 +252,7 @@ class WaveformCorrector:
 
         # Build UI
         self.root = tk.Toplevel()
-        self.root.geometry("1100x700")
+        self.root.geometry("1100x750")
         self.root.title(f"Waveform Corrector - {self.video_dir.name}")
         self.setup_ui()
         self.load_segment()
@@ -232,6 +312,12 @@ class WaveformCorrector:
         btn_next = tk.Button(nav_btn_frame, text="Next →", command=self.next_segment, width=10)
         btn_next.pack(side="left", padx=2)
         
+        # Verification checkbox
+        self.verify_check = tk.Checkbutton(nav_btn_frame, text="✓ Verified", 
+                                          variable=self.verification_status,
+                                          command=self.on_verification_changed)
+        self.verify_check.pack(side="left", padx=20)
+        
         # Status indicator
         self.status_label = tk.Label(nav_btn_frame, text="", fg="green")
         self.status_label.pack(side="right", padx=10)
@@ -268,6 +354,13 @@ class WaveformCorrector:
         self.text_modified = True
         self.status_label.config(text="Unsaved changes...", fg="orange")
 
+    def on_verification_changed(self):
+        # Update verification status for current segment
+        self.data["segments"][self.current_index]["verified"] = self.verification_status.get()
+        self.project_manager.mark_verified(self.video_dir, self.current_index)
+        self.text_modified = True
+        self.status_label.config(text="Verification changed", fg="orange")
+
     def load_segment(self):
         seg = self.data["segments"][self.current_index]
         seg_name = seg.get("segment")
@@ -288,6 +381,11 @@ class WaveformCorrector:
         text = seg.get("text") or ""
         self.text_widget.insert("1.0", text)
         self.text_modified = False
+        
+        # load verification status
+        verified = seg.get("verified", False)
+        self.verification_status.set(verified)
+        
         self.status_label.config(text="", fg="green")
 
         # update labels
@@ -298,7 +396,8 @@ class WaveformCorrector:
         self.lbl_file.config(text=f"{channel} / {video} / {seg_name}")
         
         dur_text = ms_to_hms(len(self.audio))
-        self.lbl_idx.config(text=f"Segment {self.current_index+1}/{total} • Duration: {dur_text}")
+        verified_text = "✓" if verified else "○"
+        self.lbl_idx.config(text=f"Segment {self.current_index+1}/{total} • Duration: {dur_text} • {verified_text}")
 
         # reset selection
         self.selection = None
@@ -337,7 +436,12 @@ class WaveformCorrector:
             y = y[:m]
     
         self.ax.clear()
-        self.ax.plot(t, y, linewidth=0.5, color='blue', alpha=0.7)
+        
+        # Color waveform based on verification status
+        seg = self.data["segments"][self.current_index]
+        color = 'green' if seg.get("verified", False) else 'blue'
+        
+        self.ax.plot(t, y, linewidth=0.5, color=color, alpha=0.7)
         self.ax.axhline(y=0, color='black', linewidth=0.5, alpha=0.3)
         self.ax.set_xlim(0, duration_s)
         self.ax.set_ylim(-1.05, 1.05)
@@ -345,10 +449,14 @@ class WaveformCorrector:
         self.ax.set_ylabel("Amplitude")
         self.ax.grid(True, alpha=0.3)
         
-        # Add segment number in corner
-        self.ax.text(0.02, 0.95, f"Segment {self.current_index+1}", 
+        # Add segment number in corner with verification status
+        verified = seg.get("verified", False)
+        status_text = f"Segment {self.current_index+1} {'✓' if verified else '○'}"
+        bg_color = "lightgreen" if verified else "yellow"
+        
+        self.ax.text(0.02, 0.95, status_text, 
                     transform=self.ax.transAxes, fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.5))
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor=bg_color, alpha=0.5))
         
         self.canvas.draw_idle()
 
@@ -481,8 +589,8 @@ class WaveformCorrector:
 
         # update transcript.json
         cur_seg = self.data["segments"][self.current_index]
-        left_seg = {**cur_seg, "segment": left_path.name}
-        right_seg = {**cur_seg, "segment": right_path.name, "text": ""}
+        left_seg = {**cur_seg, "segment": left_path.name, "verified": False}
+        right_seg = {**cur_seg, "segment": right_path.name, "text": "", "verified": False}
         
         # Replace current segment with two segments
         self.data["segments"].pop(self.current_index)
@@ -498,7 +606,7 @@ class WaveformCorrector:
                           f"Saved:\n{left_path.name}\n{right_path.name}\n\nOriginal backed up as {backup.name}")
         
         # Update project manager
-        self.project_manager.mark_modified(self.video_dir)
+        self.project_manager.mark_verified(self.video_dir)
         
         # Reload to show first (left) new segment
         self.load_segment()
@@ -519,7 +627,7 @@ class WaveformCorrector:
         export_wav(new_audio, self.audio_path)
 
         # Update project manager
-        self.project_manager.mark_modified(self.video_dir)
+        self.project_manager.mark_verified(self.video_dir)
         
         # update in-memory audio and replot
         self.audio = new_audio
@@ -540,7 +648,8 @@ class WaveformCorrector:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
         
         # Update project manager
-        self.project_manager.mark_modified(self.video_dir)
+        self.project_manager.transcripts[str(self.video_dir)] = self.data
+        self.project_manager.mark_verified(self.video_dir, self.current_index)
         
         self.text_modified = False
         self.status_label.config(text="✓ Saved", fg="green")
@@ -553,7 +662,7 @@ class WaveformCorrector:
         if self.text_modified:
             text = self.text_widget.get("1.0", tk.END).strip()
             self.data["segments"][self.current_index]["text"] = text
-            self.project_manager.mark_modified(self.video_dir)
+            self.project_manager.mark_verified(self.video_dir, self.current_index)
             self.text_modified = False
         
         if self.current_index < len(self.data["segments"]) - 1:
@@ -564,7 +673,7 @@ class WaveformCorrector:
         if self.text_modified:
             text = self.text_widget.get("1.0", tk.END).strip()
             self.data["segments"][self.current_index]["text"] = text
-            self.project_manager.mark_modified(self.video_dir)
+            self.project_manager.mark_verified(self.video_dir, self.current_index)
             self.text_modified = False
         
         if self.current_index > 0:
@@ -642,7 +751,7 @@ class TranscriptionBrowser:
         search_entry = tk.Entry(search_frame, textvariable=self.search_var, width=30)
         search_entry.pack(side="left")
         
-         # Container for tree + scrollbars (so we can use grid safely)
+        # Container for tree + scrollbars
         tree_container = tk.Frame(middle_frame)
         tree_container.pack(fill="both", expand=True)
         
@@ -655,7 +764,7 @@ class TranscriptionBrowser:
         hsb = ttk.Scrollbar(tree_container, orient="horizontal", command=self.video_tree.xview)
         self.video_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         
-        # Now grid INSIDE tree_container (legal!)
+        # Now grid INSIDE tree_container
         self.video_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
@@ -685,6 +794,11 @@ class TranscriptionBrowser:
         btn_save_all = tk.Button(right_frame, text="💾 Save All", command=self.save_all_transcripts,
                                width=20, height=2, bg="#e74c3c", fg="white")
         btn_save_all.pack(pady=5)
+        
+        # Mark all as verified button
+        btn_mark_all = tk.Button(right_frame, text="✓ Mark All as Verified", command=self.mark_all_verified,
+                               width=20, height=2, bg="#f39c12", fg="white")
+        btn_mark_all.pack(pady=5)
         
         # Statistics frame
         stats_frame = tk.LabelFrame(right_frame, text="Statistics", padx=10, pady=10)
@@ -723,25 +837,29 @@ class TranscriptionBrowser:
     def update_statistics(self):
         """Update statistics display"""
         total_videos = sum(len(videos) for videos in self.project_manager.videos.values())
-        modified = sum(1 for status in self.project_manager.modified_status.values() if status[0])
         
-        # Calculate total segments
+        # Calculate verification statistics
+        verified_videos = 0
+        whisper_videos = 0
         total_segments = 0
-        transcribed_segments = 0
+        verified_segments = 0
         
-        for data in self.project_manager.transcripts.values():
-            segments = data.get("segments", [])
-            total_segments += len(segments)
-            transcribed_segments += sum(1 for seg in segments if seg.get("text", "").strip())
+        for status in self.project_manager.status_tracker.values():
+            if status["verified"]:
+                verified_videos += 1
+            elif status["whisper_generated"]:
+                whisper_videos += 1
+            verified_segments += status["segments_verified"]
+            total_segments += status["total_segments"]
         
-        # Update progress
+        # Update progress (based on verified segments)
         if total_segments > 0:
-            progress = (transcribed_segments / total_segments) * 100
+            progress = (verified_segments / total_segments) * 100
             self.progress_var.set(progress)
-            self.progress_label.config(text=f"{progress:.1f}% complete ({transcribed_segments}/{total_segments} segments)")
+            self.progress_label.config(text=f"{progress:.1f}% verified ({verified_segments}/{total_segments} segments)")
         else:
             self.progress_var.set(0)
-            self.progress_label.config(text="0% complete")
+            self.progress_label.config(text="0% verified")
         
         # Update stats text
         self.stats_text.config(state=tk.NORMAL)
@@ -751,12 +869,13 @@ class TranscriptionBrowser:
 ────────────────
 Channels: {len(self.project_manager.channels)}
 Videos: {total_videos}
-Modified: {modified}
-Pending: {total_videos - modified}
+✓ Verified: {verified_videos}
+○ Whisper Generated: {whisper_videos}
+○ Empty: {total_videos - verified_videos - whisper_videos}
 ────────────────
-Segments: {total_segments}
-Transcribed: {transcribed_segments}
-Remaining: {total_segments - transcribed_segments}"""
+Total Segments: {total_segments}
+✓ Verified Segments: {verified_segments}
+○ Pending Segments: {total_segments - verified_segments}"""
         
         self.stats_text.insert(1.0, stats)
         self.stats_text.config(state=tk.DISABLED)
@@ -782,18 +901,21 @@ Remaining: {total_segments - transcribed_segments}"""
             status = self.project_manager.get_video_info(video_dir)
             
             # Determine icon/color based on status
-            if "✓ Modified" in status:
-                tag = "modified"
+            if "✓ Verified" in status:
+                tag = "verified"
+            elif "Whisper Generated" in status:
+                tag = "whisper"
             else:
-                tag = "pending"
+                tag = "empty"
             
             # Insert into tree
             item = self.video_tree.insert("", "end", text=video_dir.name, 
                                          values=(status,), tags=(tag,))
         
         # Configure tags for coloring
-        self.video_tree.tag_configure("modified", foreground="green")
-        self.video_tree.tag_configure("pending", foreground="gray")
+        self.video_tree.tag_configure("verified", foreground="green")
+        self.video_tree.tag_configure("whisper", foreground="orange")
+        self.video_tree.tag_configure("empty", foreground="gray")
     
     def filter_videos(self, *args):
         """Filter videos based on search text"""
@@ -812,7 +934,15 @@ Remaining: {total_segments - transcribed_segments}"""
         for video_dir in video_dirs:
             if search_text in video_dir.name.lower():
                 status = self.project_manager.get_video_info(video_dir)
-                tag = "modified" if "✓ Modified" in status else "pending"
+                
+                # Determine tag
+                if "✓ Verified" in status:
+                    tag = "verified"
+                elif "Whisper Generated" in status:
+                    tag = "whisper"
+                else:
+                    tag = "empty"
+                    
                 self.video_tree.insert("", "end", text=video_dir.name, 
                                       values=(status,), tags=(tag,))
     
@@ -860,6 +990,24 @@ Remaining: {total_segments - transcribed_segments}"""
         self.current_corrector = WaveformCorrector(transcript_path, self.project_manager)
         self.status_bar.config(text=f"Opened: {video_dir.name}")
     
+    def mark_all_verified(self):
+        """Mark all Whisper-generated videos as verified (for batch processing)"""
+        if not messagebox.askyesno("Confirm", "Mark ALL Whisper-generated videos as verified?\n\nThis will change their status but won't modify the actual transcripts."):
+            return
+        
+        count = 0
+        for channel_name, video_dirs in self.project_manager.videos.items():
+            for video_dir in video_dirs:
+                if str(video_dir) in self.project_manager.status_tracker:
+                    status = self.project_manager.status_tracker[str(video_dir)]
+                    if status["whisper_generated"] and not status["verified"]:
+                        self.project_manager.mark_all_verified(video_dir)
+                        count += 1
+        
+        self.refresh_lists()
+        messagebox.showinfo("Complete", f"Marked {count} videos as verified.")
+        self.status_bar.config(text=f"Marked {count} videos as verified")
+    
     def on_video_double_click(self, event):
         """Handle double-click on video item"""
         self.open_selected_video()
@@ -873,7 +1021,7 @@ Remaining: {total_segments - transcribed_segments}"""
     def save_all_transcripts(self):
         """Save all modified transcripts"""
         saved = self.project_manager.save_all()
-        messagebox.showinfo("Save Complete", f"Saved {saved} modified transcripts.")
+        messagebox.showinfo("Save Complete", f"Saved {saved} transcripts.")
         self.refresh_lists()
         self.status_bar.config(text=f"Saved {saved} transcripts")
     
@@ -889,7 +1037,6 @@ if __name__ == "__main__":
     base_dir = Path("Youtube/preprocess")
     if not base_dir.exists():
         # Ask user to select directory
-        from tkinter import filedialog
         selected_dir = filedialog.askdirectory(title="Select preprocess directory")
         if selected_dir:
             base_dir = Path(selected_dir)
