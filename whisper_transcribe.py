@@ -10,6 +10,9 @@ def transcribe_video(video_dir):
     model = whisper.load_model("tiny")  # or "large" for better accuracy
     
     transcript_path = video_dir / "transcript.json"
+    if not transcript_path.exists():
+        print(f"❌ No transcript.json found in {video_dir}, skipping folder.")
+        return
     with open(transcript_path, 'r') as f:
         data = json.load(f)
     
