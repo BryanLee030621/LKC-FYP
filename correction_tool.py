@@ -51,11 +51,11 @@ class ProjectManager:
     def load_project(self):
         """Scan directory structure and load all transcripts"""
         self.channels = [d for d in self.base_dir.iterdir() if d.is_dir()]
-        
+
         for channel in self.channels:
             video_dirs = [v for v in channel.iterdir() if v.is_dir()]
             self.videos[channel.name] = video_dirs
-            
+
             for video_dir in video_dirs:
                 transcript_path = video_dir / "transcript.json"
                 if transcript_path.exists():
@@ -63,73 +63,83 @@ class ProjectManager:
                         with open(transcript_path, "r", encoding="utf-8") as f:
                             data = json.load(f)
                             self.transcripts[str(video_dir)] = data
-                            
-                            # Check if ANY segment has manually verified text (different from Whisper's pattern)
-                            # Whisper usually generates complete sentences, while manual edits might be partial
-                            has_verified_text = False
-                            whisper_generated = False
-                            
+
                             segments = data.get("segments", [])
+
+                            # Check for verification status
+                            has_verified = False
+                            has_any_text = False
+
                             for seg in segments:
                                 text = seg.get("text", "").strip()
                                 if text:
-                                    # Check if this looks like a Whisper-generated transcript
-                                    # Whisper usually produces proper sentences with punctuation
-                                    if any(punct in text for punct in ['.', '?', '!', ',']) and len(text) > 10:
-                                        whisper_generated = True
-                                    # If text exists but doesn't look like typical Whisper output,
-                                    # or if we've specifically marked it as verified
-                                    if seg.get("verified", False) or not whisper_generated:
-                                        has_verified_text = True
-                                        break
-                            
+                                    has_any_text = True
+                                if seg.get("verified", False):
+                                    has_verified = True
+
                             mod_time = transcript_path.stat().st_mtime
                             self.status_tracker[str(video_dir)] = {
-                                "verified": has_verified_text,
-                                "whisper_generated": whisper_generated,
+                                "verified": has_verified,
+                                "has_text": has_any_text,  # Simple: has text or not
                                 "last_modified": mod_time,
                                 "segments_verified": 0,
                                 "total_segments": len(segments)
                             }
                     except Exception as e:
                         print(f"Error loading {transcript_path}: {e}")
+                else:
+                    # Video folder exists but no transcript.json
+                    self.status_tracker[str(video_dir)] = {
+                        "verified": False,
+                        "has_text": False,
+                        "last_modified": 0,
+                        "segments_verified": 0,
+                        "total_segments": 0
+                    }
     
     def get_video_info(self, video_dir):
         """Get video information for display"""
         if str(video_dir) not in self.status_tracker:
             return "○ No transcript"
-        
+
         status = self.status_tracker[str(video_dir)]
-        
+
         # Calculate verified segments count
+        verified_count = 0
+        total_segments = 0
+
         if str(video_dir) in self.transcripts:
             segments = self.transcripts[str(video_dir)].get("segments", [])
-            total = len(segments)
-            verified = sum(1 for seg in segments if seg.get("verified", False))
-            status["segments_verified"] = verified
-            status["total_segments"] = total
-        
-        # Determine display status
+            total_segments = len(segments)
+            verified_count = sum(1 for seg in segments if seg.get("verified", False))
+
+            # Update the status tracker
+            status["segments_verified"] = verified_count
+            status["total_segments"] = total_segments
+
+        # SIMPLIFIED LOGIC:
         if status["verified"]:
             display_status = "✓ Verified"
-            color = "green"
-        elif status["whisper_generated"]:
-            display_status = "○ Whisper Generated (Pending)"
-            color = "orange"
+        elif status["has_text"]:
+            display_status = "○ Whisper Generated"
+        elif total_segments == 0:
+            # No transcript.json file or empty segments array
+            display_status = "○ No transcript"
         else:
-            display_status = "○ Empty"
-            color = "gray"
-        
-        # Add segment counts
-        display_status = f"{display_status} ({status['segments_verified']}/{status['total_segments']})"
-        
+            # Has segments but all text is empty
+            display_status = "○ Empty segments"
+
+        # Add segment counts if we have segments
+        if total_segments > 0:
+            display_status = f"{display_status} ({verified_count}/{total_segments})"
+
         # Add modification time if verified
-        if status["verified"]:
+        if status["verified"] and status["last_modified"]:
             mod_str = datetime.fromtimestamp(status["last_modified"]).strftime("%Y-%m-%d %H:%M")
             display_status = f"{display_status} @ {mod_str}"
-        
+
         return display_status
-    
+
     def mark_verified(self, video_dir, segment_index=None):
         """Mark a video or specific segment as manually verified"""
         if str(video_dir) in self.status_tracker:
@@ -297,6 +307,9 @@ class WaveformCorrector:
         
         btn_delete = tk.Button(edit_frame, text="🗑 Delete", command=self.delete_selection, width=8)
         btn_delete.grid(row=0, column=1, padx=2)
+
+        btn_delete_segment = tk.Button(edit_frame, text="🗑 Del Seg", command=self.delete_current_segment, width=10)
+        btn_delete_segment.grid(row=0, column=2, padx=2)
 
         # Navigation controls
         nav_btn_frame = tk.Frame(self.root)
@@ -635,6 +648,52 @@ class WaveformCorrector:
                           f"Deleted region {ms_to_hms(start_ms)} - {ms_to_hms(end_ms)}. Original backed up as {backup.name}")
         self.load_segment()
 
+    def delete_current_segment(self):
+        """Delete the current entire segment: audio file and JSON entry"""
+        if not messagebox.askyesno("Confirm Delete", f"Delete this entire segment?\n\nAudio: {self.audio_path.name}\nThis action cannot be undone."):
+            return
+
+        try:
+            # 1. Backup the original audio file before deletion
+            backup = self.audio_path.with_suffix(self.audio_path.suffix + ".bak")
+            if not backup.exists():
+                shutil.copy2(self.audio_path, backup)
+            
+            # 2. Delete the physical audio file from disk
+            self.audio_path.unlink()
+            print(f"Deleted audio file: {self.audio_path}")
+            
+            # 3. Remove the segment entry from the in-memory data list
+            deleted_segment = self.data["segments"].pop(self.current_index)
+            print(f"Removed segment entry: {deleted_segment.get('segment')}")
+            
+            # 4. Update project manager status
+            self.project_manager.mark_verified(self.video_dir)
+            
+            # 5. Handle navigation after deletion
+            total_remaining = len(self.data["segments"])
+            
+            if total_remaining == 0:
+                # No segments left in this video
+                messagebox.showinfo("Last Segment", "All segments deleted. Closing this video.")
+                self.on_close()
+                return
+            elif self.current_index >= total_remaining:
+                # If we deleted the last segment, move to the new last one
+                self.current_index = total_remaining - 1
+            
+            # 6. Save the updated transcript (without the deleted segment) to file
+            with open(self.transcript_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            
+            # 7. Reload the UI to show the now-current segment
+            messagebox.showinfo("Delete Complete", 
+                              f"Segment deleted successfully.\n{total_remaining} segments remaining.")
+            self.load_segment()
+            
+        except Exception as e:
+            messagebox.showerror("Delete Failed", f"Error deleting segment:\n{str(e)}")
+
     # ---------------------------
     # navigation & save
     # ---------------------------
@@ -837,21 +896,24 @@ class TranscriptionBrowser:
     def update_statistics(self):
         """Update statistics display"""
         total_videos = sum(len(videos) for videos in self.project_manager.videos.values())
-        
-        # Calculate verification statistics
+
+        # Calculate statistics
         verified_videos = 0
         whisper_videos = 0
+        empty_videos = 0
         total_segments = 0
         verified_segments = 0
-        
+
         for status in self.project_manager.status_tracker.values():
             if status["verified"]:
                 verified_videos += 1
-            elif status["whisper_generated"]:
+            elif status["has_text"]:
                 whisper_videos += 1
+            else:
+                empty_videos += 1
             verified_segments += status["segments_verified"]
             total_segments += status["total_segments"]
-        
+
         # Update progress (based on verified segments)
         if total_segments > 0:
             progress = (verified_segments / total_segments) * 100
@@ -860,23 +922,23 @@ class TranscriptionBrowser:
         else:
             self.progress_var.set(0)
             self.progress_label.config(text="0% verified")
-        
-        # Update stats text
+
+        # Update stats text with clearer categories
         self.stats_text.config(state=tk.NORMAL)
         self.stats_text.delete(1.0, tk.END)
-        
+
         stats = f"""📊 Project Statistics
-────────────────
-Channels: {len(self.project_manager.channels)}
-Videos: {total_videos}
-✓ Verified: {verified_videos}
-○ Whisper Generated: {whisper_videos}
-○ Empty: {total_videos - verified_videos - whisper_videos}
-────────────────
-Total Segments: {total_segments}
-✓ Verified Segments: {verified_segments}
-○ Pending Segments: {total_segments - verified_segments}"""
-        
+    ────────────────
+    Channels: {len(self.project_manager.channels)}
+    Videos: {total_videos}
+    ✓ Verified: {verified_videos}
+    ○ Whisper Generated: {whisper_videos}
+    ○ Empty/No Transcript: {empty_videos}
+    ────────────────
+    Total Segments: {total_segments}
+    ✓ Verified Segments: {verified_segments}
+    ○ Pending Segments: {total_segments - verified_segments}"""
+
         self.stats_text.insert(1.0, stats)
         self.stats_text.config(state=tk.DISABLED)
     
