@@ -12,6 +12,7 @@ import torch
 try:
     from df.enhance import init_df, enhance, load_audio, save_audio
     import whisper
+    from qwen_asr import Qwen3ASRModel
 except ImportError as e:
     print(f"Warning: Missing dependency - {e}")
 
@@ -64,7 +65,19 @@ class ToolTester:
 
         print("\n--- Initializing Models ---")
         df_model, df_state, _ = init_df()
+        
+        print("Loading Whisper Large...")
         whisper_model = whisper.load_model("large").to(self.device)
+        
+        print("Loading Qwen3-ASR 1.7B...")
+        # Using float16 for safety on most GPUs. Switch to bfloat16 if using Ampere (A40/A100/RTX3000+)
+        qwen_model = Qwen3ASRModel.from_pretrained(
+            "Qwen/Qwen3-ASR-1.7B", 
+            dtype=torch.float16, 
+            device_map="auto"
+        )
+        
+        print("Loading Silero VAD...")
         vad_model, utils = torch.hub.load(
             repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, trust_repo=True
         )
@@ -120,9 +133,17 @@ class ToolTester:
                 chunk_tensor = enhanced_16k[:, ts['start']:ts['end']]
                 torchaudio.save(final_segment_path, chunk_tensor, self.target_sr)
                 
-                # Transcribe with Whisper
-                result = whisper_model.transcribe(str(final_segment_path), language="ms", initial_prompt="Berikut adalah perbualan dalam bahasa Melayu:")
-                whisper_text = result['text'].strip()
+                # --- Transcribe with Whisper ---
+                whisper_result = whisper_model.transcribe(
+                    str(final_segment_path), 
+                    language="ms", 
+                    initial_prompt="Berikut adalah perbualan dalam bahasa Melayu:"
+                )
+                whisper_text = whisper_result['text'].strip()
+                
+                # --- Transcribe with Qwen3-ASR ---
+                qwen_result = qwen_model.transcribe(audio=str(final_segment_path))
+                qwen_text = qwen_result[0].text.strip() if qwen_result else ""
                 
                 # Append to JSON data list
                 transcript_data.append({
@@ -130,13 +151,16 @@ class ToolTester:
                     "start_time": abs_start_ms / 1000.0,
                     "end_time": abs_end_ms / 1000.0,
                     "duration": duration,
-                    "text": "",             # Blank for fast test_tool run
+                    "text": "",             # Blank for fast test_tool run (requires PaddleOCR/Video)
                     "whisper_text": whisper_text,      
-                    "qwen_text": "",        # Blank for fast test_tool run
-                    "audio_path": str(final_segment_path.relative_to(self.output_base.parent))
+                    "qwen_text": qwen_text, 
+                    "audio_path": str(final_segment_path.relative_to(self.output_base.parent)),
+                    "verified": False       # Default to False for correction_tool.py
                 })
                 
-                print(f"       🗣️ {segment_filename}: {whisper_text[:60]}...")
+                print(f"\n       File: {segment_filename}")
+                print(f"       🗣️ Whisper: {whisper_text[:100]}...")
+                print(f"       🤖 Qwen3:   {qwen_text[:100]}...")
                 segment_counter += 1
 
         # Cleanup temp full audio
@@ -153,7 +177,7 @@ class ToolTester:
             }, f, indent=2, ensure_ascii=False)
             
         print(f"\n✅ Ultimate Pipeline Test Complete! Processed {segment_counter - 1} total segments.")
-        print(f"📂 Check '{video_output_dir}' for audio files and transcript.json")
+        print(f"📂 Check '{video_output_dir}' for audio files and your newly formatted transcript.json")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
