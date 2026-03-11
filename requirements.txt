@@ -1,0 +1,63 @@
+# Audio & Media Processing
+librosa
+soundfile
+pydub
+opencv-python-headless
+
+# Core ML & Math
+numpy
+torch
+torchaudio
+
+# Neural Denoising
+deepfilternet
+resemble-enhance
+
+# ASR Models (Whisper & Qwen)
+openai-whisper
+transformers
+accelerate
+
+# OCR (PaddleOCR)
+paddlepaddle-gpu
+paddleocr
+
+# Correction tool
+certifi==2026.2.25
+charset-normalizer==3.4.4
+colorama==0.4.6
+contourpy==1.3.0
+cycler==0.12.1
+filelock==3.19.1
+fonttools==4.60.2
+fsspec==2025.10.0
+idna==3.11
+importlib_resources==6.5.2
+Jinja2==3.1.6
+kiwisolver==1.4.7
+llvmlite==0.43.0
+MarkupSafe==3.0.3
+matplotlib==3.9.4
+more-itertools==10.8.0
+mpmath==1.3.0
+networkx==3.2.1
+numba==0.60.0
+numpy==2.0.2
+openai-whisper==20250625
+packaging==26.0
+pillow==11.3.0
+pydub==0.25.1
+pygame==2.6.1
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+regex==2026.1.15
+requests==2.32.5
+six==1.17.0
+sympy==1.14.0
+tiktoken==0.12.0
+torch==2.8.0
+tqdm==4.67.3
+typing_extensions==4.15.0
+urllib3==2.6.3
+yt-dlp==2025.10.14
+zipp==3.23.0

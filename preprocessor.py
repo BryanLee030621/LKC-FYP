@@ -1,151 +1,217 @@
 import os
 import json
 import subprocess
+import shutil
 from pathlib import Path
 import librosa
 import soundfile as sf
-from pydub import AudioSegment, silence
+import torchaudio
+from pydub import AudioSegment
 import numpy as np
+import torch
+import cv2
+
+# --- Deep Learning Dependencies ---
+try:
+    import whisper
+    from df.enhance import init_df, enhance, load_audio, save_audio
+    from paddleocr import PaddleOCR
+    from transformers import AutoProcessor, Qwen2AudioForConditionalGeneration
+except ImportError as e:
+    print(f"Warning: Missing dependency - {e}")
+    print("Please install required neural libraries before running full pipeline.")
 
 class YouTubePreprocessor:
-    def __init__(self, root_dir="Youtube"):
+    def __init__(self, root_dir="Youtube", delete_video_after=False):
         self.root_dir = Path(root_dir)
         self.output_dir = self.root_dir / "preprocess"
         self.output_dir.mkdir(exist_ok=True)
         
-    def convert_to_wav(self, input_path, output_path):
-        """Convert any audio format to WAV 16kHz mono"""
+        self.delete_video_after = delete_video_after
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.target_sr = 16000
+        print(f"Initializing pipeline on {self.device.upper()}...")
+
+        # 1. Init Silero VAD
+        self.vad_model, utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad', model='silero_vad',
+            force_reload=False, trust_repo=True
+        )
+        self.get_speech_timestamps = utils[0]
+
+        # 2. Init DeepFilterNet (Primary Denoiser)
+        self.df_model, self.df_state, _ = init_df()
+
+        # 3. Init ASR Models
+        print("Loading Whisper Large...")
+        self.whisper_model = whisper.load_model("large").to(self.device)
+        
+        print("Loading Qwen1.7B Audio...")
+        self.qwen_processor = AutoProcessor.from_pretrained("Qwen/Qwen-Audio")
+        self.qwen_model = Qwen2AudioForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen-Audio", device_map="auto"
+        )
+
+        # 4. Init PaddleOCR
+        self.ocr = PaddleOCR(use_angle_cls=True, lang='ms', use_gpu=(self.device == "cuda"))
+
+    def convert_to_wav(self, input_path, output_path, target_sr):
         cmd = [
             "ffmpeg", "-i", str(input_path),
-            "-ar", "16000", "-ac", "1",
+            "-ar", str(target_sr), "-ac", "1",
             "-acodec", "pcm_s16le",
-            "-y", str(output_path)  # -y to overwrite
+            "-y", str(output_path), "-loglevel", "error"
         ]
-        subprocess.run(cmd, capture_output=True)
-        
-    def split_at_silence(self, audio_path, max_duration=30, min_silence_len=500, silence_thresh=-40):
-        """
-        Split audio at natural pauses (silence)
-        Returns list of (start_ms, end_ms) segments
-        """
-        audio = AudioSegment.from_wav(audio_path)
-        
-        # Detect non-silent chunks
-        chunks = silence.detect_nonsilent(
-            audio,
-            min_silence_len=min_silence_len,
-            silence_thresh=silence_thresh
-        )
+        subprocess.run(cmd)
 
-        # If no chunks detected, treat whole audio as a single segment
-        if not chunks:
-            return [(0, len(audio))]
+    def group_vad_timestamps(self, timestamps, max_sec=29.0):
+        max_samples = int(max_sec * self.target_sr)
+        if not timestamps: return []
 
-        # Merge chunks into segments ≤ max_duration
-        segments = []
-        current_start, current_end = chunks[0]
-        
-        for start, end in chunks[1:]:
-            if (end - current_start) / 1000 <= max_duration:
-                current_end = end
+        grouped = []
+        current_start = timestamps[0]['start']
+        current_end = timestamps[0]['end']
+
+        for i in range(1, len(timestamps)):
+            ts = timestamps[i]
+            if (ts['end'] - current_start) <= max_samples:
+                current_end = ts['end']
             else:
-                # Segment too long, save current and start new
-                segments.append((current_start, current_end))
-                current_start, current_end = start, end
+                grouped.append({'start': current_start, 'end': current_end})
+                current_start = ts['start']
+                current_end = ts['end']
+
+        grouped.append({'start': current_start, 'end': current_end})
+        return grouped
+
+    def extract_gold_transcript(self, video_path, start_ms, end_ms):
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        start_frame = int((start_ms / 1000.0) * fps)
+        end_frame = int((end_ms / 1000.0) * fps)
         
-        # Add last segment
-        segments.append((current_start, current_end))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        extracted_texts = set()
+        frame_step = int(fps) 
         
-        # Final pass: split any segment > max_duration
-        final_segments = []
-        for start, end in segments:
-            duration = (end - start) / 1000
-            
-            if duration <= max_duration:
-                final_segments.append((start, end))
-            else:
-                # Split evenly but try to find silence points
-                num_splits = int(np.ceil(duration / max_duration))
-                split_duration = duration / num_splits
+        for frame_idx in range(start_frame, end_frame, frame_step):
+            ret, frame = cap.read()
+            if not ret: break
                 
-                for i in range(num_splits):
-                    seg_start = start + int(i * split_duration * 1000)
-                    seg_end = start + int((i + 1) * split_duration * 1000)
-                    final_segments.append((seg_start, min(seg_end, end)))
+            height, width = frame.shape[:2]
+            subtitle_crop = frame[int(height*0.8):height, :] 
+            
+            result = self.ocr.ocr(subtitle_crop, cls=True)
+            if result and result[0]:
+                for line in result[0]:
+                    extracted_texts.add(line[1][0])
+                    
+        cap.release()
+        return " ".join(list(extracted_texts))
+
+    def transcribe_with_asr(self, audio_path):
+        whisper_result = self.whisper_model.transcribe(str(audio_path), language="ms", initial_prompt="Berikut adalah perbualan dalam bahasa Melayu:")
+        whisper_text = whisper_result["text"].strip()
         
-        return final_segments
-    
-    def reduce_noise(self, audio_array, sr):
-        """Simple noise reduction using spectral gating"""
-        import noisereduce as nr
-        return nr.reduce_noise(
-            y=audio_array,
-            sr=sr,
-            stationary=False,
-            prop_decrease=0.75  # Reduce noise by 75%
-        )
-    
-    def preprocess_video(self, channel, video_file):
-        """Process a single video file"""
-        # Clean video name (remove extension and special chars)
-        video_name = Path(video_file).stem
+        audio_np, sr = librosa.load(str(audio_path), sr=self.target_sr)
+        inputs = self.qwen_processor(audios=audio_np, return_tensors="pt").to(self.device)
+        generated_ids = self.qwen_model.generate(**inputs, max_length=256)
+        qwen_text = self.qwen_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        
+        return whisper_text, qwen_text
+
+    def preprocess_video(self, channel, audio_path, video_path):
+        video_name = audio_path.stem
         video_name_clean = "".join(c for c in video_name if c.isalnum() or c in " _-")
         
-        # Create output directory
         video_output_dir = self.output_dir / channel / video_name_clean
         video_output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Check and skip preprocessed files
-        video_output_dir = self.output_dir / channel / video_name_clean
-        if video_output_dir.exists() and (video_output_dir / "transcript.json").exists():
-            print(f"Skipping {video_file}, already processed")
+        if (video_output_dir / "transcript.json").exists():
+            print(f"Skipping {audio_path.name}, already processed")
             return 0
-        
-        # Convert to WAV
-        input_path = self.root_dir / channel / video_file
+            
         temp_wav = video_output_dir / "temp_full.wav"
-        self.convert_to_wav(input_path, temp_wav)
         
-        # Split into segments
-        segments = self.split_at_silence(temp_wav)
+        print(f"  -> Converting to Native DF Sample Rate ({self.df_state.sr()}Hz)...")
+        self.convert_to_wav(audio_path, temp_wav, self.df_state.sr())
         
-        # Process each segment
+        wav, sr = torchaudio.load(temp_wav)
+        total_samples = wav.shape[1]
+        
+        # 10-Minute Chunk Math
+        chunk_sec = 10 * 60
+        chunk_samples = self.df_state.sr() * chunk_sec
+        
         transcript_data = []
+        segment_counter = 1
         
-        for i, (start_ms, end_ms) in enumerate(segments, 1):
-            # Load the segment
-            audio = AudioSegment.from_wav(temp_wav)
-            segment = audio[start_ms:end_ms]
+        for start_idx in range(0, total_samples, chunk_samples):
+            end_idx = min(start_idx + chunk_samples, total_samples)
+            ten_min_chunk = wav[:, start_idx:end_idx]
             
-            # Export segment
-            segment_filename = f"segment_{i:03d}.wav"
-            segment_path = video_output_dir / segment_filename
-            segment.export(segment_path, format="wav")
+            start_min = (start_idx / sr) / 60
+            end_min = (end_idx / sr) / 60
+            print(f"\n  -> Processing 10-min block: {start_min:.1f}m to {end_min:.1f}m...")
             
-            # Optional: Apply noise reduction
-            y, sr = librosa.load(segment_path, sr=16000)
-            if self.has_background_noise(y, sr):
-                y_clean = self.reduce_noise(y, sr)
-                sf.write(segment_path, y_clean, sr)
+            # 1. DeepFilterNet Denoising
+            try:
+                enhanced_48k = enhance(self.df_model, self.df_state, ten_min_chunk)
+            except Exception as e:
+                print(f"    ⚠️ DeepFilterNet failed on block ({e}). Skipping this 10m block.")
+                continue
+
+            # 2. Resample to 16kHz for VAD and ASR
+            enhanced_16k = torchaudio.functional.resample(enhanced_48k, orig_freq=self.df_state.sr(), new_freq=self.target_sr)
             
-            # Add to transcript data
-            duration = (end_ms - start_ms) / 1000.0
-            transcript_data.append({
-                "segment": segment_filename,
-                "start_time": start_ms / 1000.0,
-                "end_time": end_ms / 1000.0,
-                "duration": duration,
-                "text": "",  # To be filled by Whisper
-                "audio_path": str(segment_path.relative_to(self.root_dir))
-            })
+            # 3. Silero VAD
+            raw_timestamps = self.get_speech_timestamps(enhanced_16k.squeeze(), self.vad_model, sampling_rate=self.target_sr)
             
-            # Print progress
-            print(f"  Created {segment_filename} ({duration:.1f}s)")
-        
-        # Remove temp file
+            # 4. Grouping (<30s)
+            grouped_timestamps = self.group_vad_timestamps(raw_timestamps)
+            print(f"    VAD found {len(grouped_timestamps)} Whisper-ready chunks in this block.")
+
+            # 5. Extract, Transcribe, and Save Chunks
+            for ts in grouped_timestamps:
+                # Calculate absolute milliseconds (Relative chunk time + Absolute block time)
+                rel_start_ms = (ts['start'] / self.target_sr) * 1000
+                rel_end_ms = (ts['end'] / self.target_sr) * 1000
+                
+                abs_start_ms = ((start_idx / sr) * 1000) + rel_start_ms
+                abs_end_ms = ((start_idx / sr) * 1000) + rel_end_ms
+                duration = (abs_end_ms - abs_start_ms) / 1000.0
+                
+                segment_filename = f"segment_{segment_counter:04d}.wav"
+                final_segment_path = video_output_dir / segment_filename
+                
+                # Slice the pristine 16k audio and save
+                chunk_tensor = enhanced_16k[:, ts['start']:ts['end']]
+                torchaudio.save(final_segment_path, chunk_tensor, self.target_sr)
+                
+                # Transcription & OCR
+                gold_text = ""
+                if video_path and video_path.exists():
+                    gold_text = self.extract_gold_transcript(video_path, abs_start_ms, abs_end_ms)
+                
+                whisper_text, qwen_text = self.transcribe_with_asr(final_segment_path)
+                
+                transcript_data.append({
+                    "segment": segment_filename,
+                    "start_time": abs_start_ms / 1000.0,
+                    "end_time": abs_end_ms / 1000.0,
+                    "duration": duration,
+                    "text": gold_text,                 
+                    "whisper_text": whisper_text,      
+                    "qwen_text": qwen_text,            
+                    "audio_path": str(final_segment_path.relative_to(self.root_dir))
+                })
+                
+                print(f"    ✅ Processed {segment_filename} ({duration:.1f}s)")
+                segment_counter += 1
+            
         temp_wav.unlink()
         
-        # Save transcript JSON
+        # Save Metadata
         transcript_path = video_output_dir / "transcript.json"
         with open(transcript_path, 'w', encoding='utf-8') as f:
             json.dump({
@@ -154,79 +220,71 @@ class YouTubePreprocessor:
                 "segments": transcript_data,
                 "total_duration": sum(s["duration"] for s in transcript_data)
             }, f, indent=2, ensure_ascii=False)
-        
-        return len(segments)
-    
-    def has_background_noise(self, audio, sr, threshold=0.02):
-        """Simple check for background noise"""
-        energy = np.mean(audio**2)
-        return energy < threshold
-    
+            
+        if self.delete_video_after and video_path and video_path.exists():
+            print(f"  -> Cleaning up video file: {video_path.name}")
+            video_path.unlink()
+            
+        return segment_counter - 1
+
     def run(self):
-        """Main processing loop"""
         total_segments = 0
         total_videos = 0
         
-        # Process each channel folder
         for channel_dir in self.root_dir.iterdir():
-            if not channel_dir.is_dir() or channel_dir.name == "preprocess":
-                continue
-            
+            if not channel_dir.is_dir() or channel_dir.name == "preprocess": continue
+                
             channel = channel_dir.name
-            print(f"\nProcessing channel: {channel}")
-            
-            # Process each audio file in channel
-            for audio_file in channel_dir.glob("*"):
-                if audio_file.suffix.lower() in ['.m4a', '.opus', '.mp3', '.mp4', '.mkv']:
-                    print(f"\nProcessing: {audio_file.name}")
-                    segments = self.preprocess_video(channel, audio_file.name)
+            for audio_path in channel_dir.glob("*"):
+                if audio_path.is_file() and audio_path.suffix.lower() in ['.m4a', '.opus', '.mp3', '.wav', '.flac']:
+                    video_dir = channel_dir / "video"
+                    video_path = None
+                    if video_dir.exists():
+                        for ext in ['.mp4', '.mkv', '.webm', '.avi']:
+                            potential_video = video_dir / f"{audio_path.stem}{ext}"
+                            if potential_video.exists():
+                                video_path = potential_video
+                                break
+                    
+                    segments = self.preprocess_video(channel, audio_path, video_path)
                     total_segments += segments
                     total_videos += 1
-        
-        # Create master metadata file
+                    
         self.create_master_metadata()
-        
-        print(f"\n✅ Preprocessing complete!")
-        print(f"   Processed {total_videos} videos")
-        print(f"   Created {total_segments} segments")
-        print(f"   Output saved to: {self.output_dir}")
-    
+        print(f"\n✅ Preprocessing complete! Created {total_segments} segments across {total_videos} videos.")
+
     def create_master_metadata(self):
-        """Create a master JSONL file for all videos"""
         master_data = []
-        
         for channel_dir in self.output_dir.iterdir():
-            if not channel_dir.is_dir():
-                continue
-            
+            if not channel_dir.is_dir(): continue
             for video_dir in channel_dir.iterdir():
-                if not video_dir.is_dir():
-                    continue
-                
+                if not video_dir.is_dir(): continue
                 transcript_file = video_dir / "transcript.json"
                 if transcript_file.exists():
-                    with open(transcript_file, 'r') as f:
+                    with open(transcript_file, 'r', encoding='utf-8') as f:
                         video_data = json.load(f)
-                    
-                    # Add each segment to master data
                     for segment in video_data["segments"]:
                         master_data.append({
                             "audio_path": segment["audio_path"],
-                            "text": segment["text"],  # Empty for now
+                            "text": segment["text"],          
+                            "whisper_text": segment.get("whisper_text", ""),
+                            "qwen_text": segment.get("qwen_text", ""),
                             "duration": segment["duration"],
                             "video": video_data["video_name"],
                             "channel": video_data["channel"]
                         })
-        
-        # Save master metadata
+                        
         master_path = self.output_dir / "metadata.jsonl"
         with open(master_path, 'w', encoding='utf-8') as f:
             for item in master_data:
                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
-        
-        print(f"\nCreated master metadata: {master_path}")
 
-# Run the preprocessor
 if __name__ == "__main__":
-    preprocessor = YouTubePreprocessor()
+    preprocessor = YouTubePreprocessor(delete_video_after=False)
+    preprocessor.run()      with open(master_path, 'w', encoding='utf-8') as f:
+            for item in master_data:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+if __name__ == "__main__":
+    preprocessor = YouTubePreprocessor(delete_video_after=False)
     preprocessor.run()
