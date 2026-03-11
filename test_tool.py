@@ -133,11 +133,17 @@ class ToolTester:
                 chunk_tensor = enhanced_16k[:, ts['start']:ts['end']]
                 torchaudio.save(final_segment_path, chunk_tensor, self.target_sr)
                 
-                # --- Transcribe with Whisper ---
+                # --- Transcribe with Whisper (Custom Parameters) ---
                 whisper_result = whisper_model.transcribe(
                     str(final_segment_path), 
+                    task="transcribe",
                     language="ms", 
-                    initial_prompt="Berikut adalah perbualan dalam bahasa Melayu:"
+                    best_of=5,
+                    condition_on_previous_text=False,
+                    initial_prompt="Berikut adalah perbualan dalam bahasa Melayu. Keep the word umm, eh, lah.",
+                    carry_initial_prompt=True,
+                    temperature=1,
+                    logprob_threshold=-2
                 )
                 whisper_text = whisper_result['text'].strip()
                 
@@ -188,8 +194,7 @@ if __name__ == "__main__":
     input_path = Path(args.input)
 
     tester = ToolTester()
-    if args.tool == 'pipeline': tester.test_pipeline(input_path)
-#t_whisper(input_path)
+    if args.tool == 'pipeline': tester.test_pipeline(input_path)t_whisper(input_path)
     elif args.tool == 'qwen':
         tester.test_qwen(input_path)
     elif args.tool == 'ocr':
