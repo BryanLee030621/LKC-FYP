@@ -90,7 +90,7 @@ What happens:
 
 - Saves the baseline data into a structured transcript.json file
 
-### Step 1: Preprocess all audio
+### Step 2: Visual subtitle extraction
 ```
 # Run the OCR sweep to extract hardcoded subtitles
 python test_tool.py --tool ocr_sweep --input "Youtube/channel/video/video_name.webm" --sample_rate 2.0
