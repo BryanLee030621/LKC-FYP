@@ -45,16 +45,19 @@ Youtube/preprocess/
 ## 🚀 Quick Start
 
 #### Clone repository (if applicable)
+```
 git clone <repository-url>
 cd whisper-bahasa-rojak
-
+```
 #### Install Python dependencies
+```
 pip install -r requirements.txt
-
+```
 #### Install system dependencies (Ubuntu/Debian)
+```
 sudo apt-get update
 sudo apt-get install ffmpeg
-
+```
 
 ## 📊 Pipeline Steps 
 ### Step 1: Preprocess all audio
