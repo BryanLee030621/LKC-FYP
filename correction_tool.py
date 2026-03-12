@@ -40,6 +40,7 @@ def ms_to_hms(ms):
 # Project Manager
 # -------------------------
 class ProjectManager:
+    # ... (unchanged, same as before) ...
     def __init__(self, base_dir="Youtube/preprocess"):
         self.base_dir = Path(base_dir)
         self.channels = []
@@ -254,6 +255,10 @@ class WaveformCorrector:
         self.text_modified = False
         self.verification_status = tk.BooleanVar(value=False)
 
+        # Widgets for reference transcriptions
+        self.whisper_text_widget = None
+        self.qwen_text_widget = None
+
         # init pygame mixer for playback
         try:
             pygame.mixer.init()
@@ -335,8 +340,30 @@ class WaveformCorrector:
         self.status_label = tk.Label(nav_btn_frame, text="", fg="green")
         self.status_label.pack(side="right", padx=10)
 
-        # Text editor for transcript
-        txt_frame = tk.LabelFrame(self.root, text="Transcription", padx=10, pady=5)
+        # --- Reference transcriptions (read‑only) ---
+        ref_frame = tk.LabelFrame(self.root, text="Reference Transcriptions", padx=10, pady=5)
+        ref_frame.pack(fill="x", padx=6, pady=(0, 6))
+
+        # Left: Whisper
+        whisper_frame = tk.Frame(ref_frame)
+        whisper_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+
+        tk.Label(whisper_frame, text="Whisper Transcription", font=("Arial", 9, "bold")).pack(anchor="w")
+        self.whisper_text_widget = tk.Text(whisper_frame, height=3, wrap="word", font=("Arial", 10))
+        self.whisper_text_widget.pack(fill="x")
+        self.whisper_text_widget.config(state=tk.DISABLED)
+
+        # Right: Qwen
+        qwen_frame = tk.Frame(ref_frame)
+        qwen_frame.pack(side="right", fill="both", expand=True, padx=(5, 0))
+
+        tk.Label(qwen_frame, text="Qwen Transcription", font=("Arial", 9, "bold")).pack(anchor="w")
+        self.qwen_text_widget = tk.Text(qwen_frame, height=3, wrap="word", font=("Arial", 10))
+        self.qwen_text_widget.pack(fill="x")
+        self.qwen_text_widget.config(state=tk.DISABLED)
+
+        # Gold standard transcription (editable)
+        txt_frame = tk.LabelFrame(self.root, text="Gold Standard Transcription", padx=10, pady=5)
         txt_frame.pack(fill="x", padx=6, pady=(0, 6))
         
         self.text_widget = tk.Text(txt_frame, height=4, wrap="word", font=("Arial", 11))
@@ -389,12 +416,26 @@ class WaveformCorrector:
         # draw waveform
         self.plot_waveform()
 
-        # load text
+        # load gold text
         self.text_widget.delete("1.0", tk.END)
         text = seg.get("text") or ""
         self.text_widget.insert("1.0", text)
         self.text_modified = False
-        
+
+        # load whisper text (read‑only)
+        whisper_text = seg.get("whisper_text", "")
+        self.whisper_text_widget.config(state=tk.NORMAL)
+        self.whisper_text_widget.delete("1.0", tk.END)
+        self.whisper_text_widget.insert("1.0", whisper_text)
+        self.whisper_text_widget.config(state=tk.DISABLED)
+
+        # load qwen text (read‑only)
+        qwen_text = seg.get("qwen_text", "")
+        self.qwen_text_widget.config(state=tk.NORMAL)
+        self.qwen_text_widget.delete("1.0", tk.END)
+        self.qwen_text_widget.insert("1.0", qwen_text)
+        self.qwen_text_widget.config(state=tk.DISABLED)
+
         # load verification status
         verified = seg.get("verified", False)
         self.verification_status.set(verified)
@@ -756,6 +797,7 @@ class WaveformCorrector:
 # Main Browser Window
 # -------------------------
 class TranscriptionBrowser:
+    # ... (unchanged, same as before) ...
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Bahasa Rojak Transcription Browser")
