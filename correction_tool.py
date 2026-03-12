@@ -40,7 +40,6 @@ def ms_to_hms(ms):
 # Project Manager
 # -------------------------
 class ProjectManager:
-    # ... (unchanged, same as before) ...
     def __init__(self, base_dir="Youtube/preprocess"):
         self.base_dir = Path(base_dir)
         self.channels = []
@@ -194,7 +193,7 @@ class ProjectManager:
                     # Determine status text
                     if status["verified"]:
                         status_text = "Verified"
-                    elif status["whisper_generated"]:
+                    elif status.get("whisper_generated", False):
                         status_text = "Whisper Generated"
                     else:
                         status_text = "Empty"
@@ -208,7 +207,7 @@ class ProjectManager:
                     video_name = video_dir.name
                     line = f'"{channel_name}","{video_name}","{status_text}",'
                     line += f'"{status["segments_verified"]}/{status["total_segments"]}",'
-                    line += f'"{status["whisper_generated"]}","{mod_str}"'
+                    line += f'"{status.get("whisper_generated", False)}","{mod_str}"'
                     lines.append(line)
         
         with open(report_path, "w", encoding="utf-8") as f:
@@ -217,7 +216,7 @@ class ProjectManager:
         return report_path
 
 # -------------------------
-# Main GUI class
+# Main Annotation GUI (Waveform Corrector) – full implementation
 # -------------------------
 class WaveformCorrector:
     def __init__(self, transcript_path: Path, project_manager: ProjectManager):
@@ -794,10 +793,501 @@ class WaveformCorrector:
         self.root.destroy()
 
 # -------------------------
-# Main Browser Window
+# Error Classification GUI with paired annotations (fixed)
+# -------------------------
+class ErrorClassificationGUI:
+    CATEGORIES = [
+        "Spelling Error",
+        "Language / Translate Error",
+        "Named Entity Error",
+        "Substitution Error",
+        "Particle Error",
+        "Merge Error",
+        "Deletion Error",
+        "Hallucination Error"
+    ]
+    # Distinct background colors per category
+    STYLES = [
+        ("Spelling", "lightblue"),
+        ("Language", "lightcoral"),
+        ("Named Entity", "lightgreen"),
+        ("Substitution", "lightsalmon"),
+        ("Particle", "lightyellow"),
+        ("Merge", "plum"),
+        ("Deletion", "lightpink"),
+        ("Hallucination", "lightgray")
+    ]
+
+    def __init__(self, transcript_path: Path, project_manager: ProjectManager):
+        self.transcript_path = Path(transcript_path)
+        self.project_manager = project_manager
+        self.video_dir = self.transcript_path.parent
+
+        if not self.transcript_path.exists():
+            raise FileNotFoundError(self.transcript_path)
+
+        with open(self.transcript_path, "r", encoding="utf-8") as f:
+            self.data = json.load(f)
+
+        if "segments" not in self.data or not isinstance(self.data["segments"], list):
+            raise ValueError("transcript.json must contain a 'segments' list")
+
+        # Ensure error tracking fields exist
+        for seg in self.data["segments"]:
+            if "error_counts" not in seg:
+                seg["error_counts"] = {cat: 0 for cat in self.CATEGORIES}
+            if "error_annotations" not in seg:
+                seg["error_annotations"] = []  # list of dicts: model, model_start, model_end, gold_start, gold_end, category
+
+        self.current_index = 0
+        self.audio = None
+        self.audio_path = None
+        self.sample_rate = 44100
+
+        # UI widgets
+        self.whisper_text = None
+        self.qwen_text = None
+        self.gold_text = None
+        self.count_labels = {}  # category -> label widget
+
+        # Pending pair selection
+        self.pending_first = None  # {'widget': widget, 'start': index, 'end': index}
+        self.pending_second = None
+
+        # Hover tracking
+        self.current_hover_annotation = None
+
+        # Build UI
+        self.root = tk.Toplevel()
+        self.root.geometry("1200x800")
+        self.root.title(f"Error Classification - {self.video_dir.name}")
+        self.setup_ui()
+        self.load_segment()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def setup_ui(self):
+        # Top control (navigation, save, prev/next)
+        top_frame = tk.Frame(self.root)
+        top_frame.pack(fill="x", padx=6, pady=6)
+
+        self.lbl_idx = tk.Label(top_frame, text="", font=("Arial", 10))
+        self.lbl_idx.pack(side="left", padx=5)
+
+        btn_prev = tk.Button(top_frame, text="← Prev", command=self.prev_segment)
+        btn_prev.pack(side="left", padx=2)
+
+        btn_save = tk.Button(top_frame, text="💾 Save", command=self.save_transcript, bg="#4CAF50", fg="white")
+        btn_save.pack(side="left", padx=2)
+
+        btn_next = tk.Button(top_frame, text="Next →", command=self.next_segment)
+        btn_next.pack(side="left", padx=2)
+
+        self.status_label = tk.Label(top_frame, text="", fg="green")
+        self.status_label.pack(side="right", padx=10)
+
+        # Main content: three text boxes
+        main_frame = tk.Frame(self.root)
+        main_frame.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # Gold (read-only but selectable)
+        gold_frame = tk.LabelFrame(main_frame, text="Gold Standard Transcription (selectable)", padx=5, pady=5)
+        gold_frame.pack(fill="x", pady=2)
+        self.gold_text = tk.Text(gold_frame, height=4, wrap="word", font=("Arial", 11))
+        self.gold_text.pack(fill="x")
+        self.gold_text.bind("<Button-1>", self.on_click_gold)
+        self.gold_text.bind("<ButtonRelease-1>", self.on_select_gold)
+        # Block typing
+        self.gold_text.bind("<Key>", lambda e: "break")
+        self.gold_text.bind("<Motion>", self.on_motion)
+
+        # Whisper & Qwen side by side
+        model_frame = tk.Frame(main_frame)
+        model_frame.pack(fill="both", expand=True, pady=5)
+
+        # Whisper (selectable)
+        whisper_frame = tk.LabelFrame(model_frame, text="Whisper Transcription", padx=5, pady=5)
+        whisper_frame.pack(side="left", fill="both", expand=True, padx=(0, 2))
+        self.whisper_text = tk.Text(whisper_frame, height=6, wrap="word", font=("Arial", 11))
+        self.whisper_text.pack(fill="both", expand=True)
+        self.whisper_text.bind("<Button-1>", self.on_click_model)
+        self.whisper_text.bind("<ButtonRelease-1>", self.on_select_model)
+        self.whisper_text.bind("<Key>", lambda e: "break")  # prevent editing
+        self.whisper_text.bind("<Motion>", self.on_motion)
+
+        # Qwen (selectable)
+        qwen_frame = tk.LabelFrame(model_frame, text="Qwen Transcription", padx=5, pady=5)
+        qwen_frame.pack(side="right", fill="both", expand=True, padx=(2, 0))
+        self.qwen_text = tk.Text(qwen_frame, height=6, wrap="word", font=("Arial", 11))
+        self.qwen_text.pack(fill="both", expand=True)
+        self.qwen_text.bind("<Button-1>", self.on_click_model)
+        self.qwen_text.bind("<ButtonRelease-1>", self.on_select_model)
+        self.qwen_text.bind("<Key>", lambda e: "break")
+        self.qwen_text.bind("<Motion>", self.on_motion)
+
+        # Configure tags for categories
+        for cat, color in self.STYLES:
+            self.whisper_text.tag_configure(cat, background=color)
+            self.qwen_text.tag_configure(cat, background=color)
+            self.gold_text.tag_configure(cat, background=color)
+
+        # Temporary highlight tag for hover
+        self.whisper_text.tag_configure("hover", background="yellow", borderwidth=2, relief="solid")
+        self.qwen_text.tag_configure("hover", background="yellow", borderwidth=2, relief="solid")
+        self.gold_text.tag_configure("hover", background="yellow", borderwidth=2, relief="solid")
+
+        # Bottom: category buttons and statistics
+        bottom_frame = tk.Frame(self.root)
+        bottom_frame.pack(fill="x", padx=6, pady=6)
+
+        # Buttons for each category
+        btn_frame = tk.LabelFrame(bottom_frame, text="Error Categories", padx=5, pady=5)
+        btn_frame.pack(side="left", fill="both", expand=True)
+
+        # Arrange in two rows of four
+        for i, cat in enumerate(self.CATEGORIES):
+            row = i // 4
+            col = i % 4
+            btn = tk.Button(btn_frame, text=cat, command=lambda c=cat: self.assign_category(c),
+                            width=20, bg=self.STYLES[i][1])
+            btn.grid(row=row, column=col, padx=2, pady=2, sticky="ew")
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
+        btn_frame.grid_columnconfigure(3, weight=1)
+
+        # Statistics frame
+        stats_frame = tk.LabelFrame(bottom_frame, text="Counts per Category", padx=5, pady=5)
+        stats_frame.pack(side="right", fill="y")
+
+        for i, cat in enumerate(self.CATEGORIES):
+            lbl = tk.Label(stats_frame, text=f"{cat[:10]}: 0", anchor="w", width=20)
+            lbl.pack(anchor="w")
+            self.count_labels[cat] = lbl
+
+        # Remove button
+        remove_btn = tk.Button(bottom_frame, text="❌ Remove Error Under Cursor", command=self.remove_annotation,
+                               bg="#f44336", fg="white")
+        remove_btn.pack(side="bottom", pady=5)
+
+        # Instructions label
+        self.instruction = tk.Label(self.root, text="Select a span in Gold, then a span in Whisper/Qwen (or vice versa), then click a category.",
+                                     fg="blue")
+        self.instruction.pack(side="bottom", pady=2)
+
+    # ------------------------------------------------------------
+    # Selection handling
+    # ------------------------------------------------------------
+    def get_selection(self, widget):
+        """Return (start, end) indices of current selection in widget, or None."""
+        try:
+            sel = widget.tag_ranges(tk.SEL)
+            if sel:
+                return (widget.index(sel[0]), widget.index(sel[1]))
+        except Exception:
+            pass
+        return None
+
+    def clear_pending(self):
+        self.pending_first = None
+        self.pending_second = None
+        self.instruction.config(text="Select a span in Gold, then a span in Whisper/Qwen (or vice versa).")
+
+    def on_click_gold(self, event):
+        pass
+
+    def on_click_model(self, event):
+        pass
+
+    def on_select_gold(self, event):
+        sel = self.get_selection(self.gold_text)
+        if not sel:
+            return
+        if self.pending_first is None:
+            # First selection is gold
+            self.pending_first = {'widget': 'gold', 'start': sel[0], 'end': sel[1]}
+            self.instruction.config(text="Now select the corresponding span in Whisper or Qwen.")
+        elif self.pending_second is None:
+            # We already have a first selection; check that it's not gold (should be model)
+            if self.pending_first['widget'] != 'gold':
+                self.pending_second = {'widget': 'gold', 'start': sel[0], 'end': sel[1]}
+                self.instruction.config(text="Ready to assign a category.")
+            else:
+                # Both selections are gold? Reset
+                self.clear_pending()
+                self.instruction.config(text="Invalid: both selections are gold. Start over.")
+        else:
+            # Both already set – ignore
+            pass
+
+    def on_select_model(self, event):
+        widget = event.widget
+        if widget == self.whisper_text:
+            model = 'whisper'
+        else:
+            model = 'qwen'
+        sel = self.get_selection(widget)
+        if not sel:
+            return
+        if self.pending_first is None:
+            self.pending_first = {'widget': model, 'start': sel[0], 'end': sel[1]}
+            self.instruction.config(text="Now select the corresponding span in Gold.")
+        elif self.pending_second is None:
+            if self.pending_first['widget'] == model:
+                # Same model twice? Reset
+                self.clear_pending()
+                self.instruction.config(text="Invalid: both selections are the same model. Start over.")
+            else:
+                self.pending_second = {'widget': model, 'start': sel[0], 'end': sel[1]}
+                self.instruction.config(text="Ready to assign a category.")
+        else:
+            pass
+
+    # ------------------------------------------------------------
+    # Category assignment
+    # ------------------------------------------------------------
+    def assign_category(self, category):
+        if self.pending_first is None or self.pending_second is None:
+            messagebox.showwarning("Incomplete", "Please select two spans (one Gold and one Whisper/Qwen) first.")
+            return
+
+        # Determine which is gold and which is model
+        gold_sel = None
+        model_sel = None
+        model_type = None
+        for sel in [self.pending_first, self.pending_second]:
+            if sel['widget'] == 'gold':
+                gold_sel = sel
+            else:
+                model_sel = sel
+                model_type = sel['widget']
+
+        if gold_sel is None or model_sel is None:
+            messagebox.showerror("Invalid", "One selection must be Gold and the other a model.")
+            self.clear_pending()
+            return
+
+        # Apply tags (widgets are already in NORMAL state)
+        model_widget = self.whisper_text if model_type == 'whisper' else self.qwen_text
+        model_widget.tag_add(category, model_sel['start'], model_sel['end'])
+        self.gold_text.tag_add(category, gold_sel['start'], gold_sel['end'])
+
+        # Store annotation
+        seg = self.data["segments"][self.current_index]
+        annotations = seg.get("error_annotations", [])
+        ann = {
+            'model': model_type,
+            'model_start': model_sel['start'],
+            'model_end': model_sel['end'],
+            'gold_start': gold_sel['start'],
+            'gold_end': gold_sel['end'],
+            'category': category
+        }
+        annotations.append(ann)
+        seg["error_annotations"] = annotations
+        seg["error_counts"][category] = seg["error_counts"].get(category, 0) + 1
+
+        # Update counts label
+        self.count_labels[category].config(text=f"{category[:15]}: {seg['error_counts'][category]}")
+
+        self.clear_pending()
+        self.status_label.config(text="Annotation added", fg="green")
+        self.root.after(2000, lambda: self.status_label.config(text=""))
+
+    # ------------------------------------------------------------
+    # Hover effect using Motion event
+    # ------------------------------------------------------------
+    def on_motion(self, event):
+        widget = event.widget
+        index = widget.index("@%d,%d" % (event.x, event.y))
+        tags = widget.tag_names(index)
+        # Find the first category tag
+        cat_tag = None
+        for t in tags:
+            if t in [c for c, _ in self.STYLES]:
+                cat_tag = t
+                break
+
+        if not cat_tag:
+            # No category under cursor – remove hover if any
+            if self.current_hover_annotation is not None:
+                self._clear_hover()
+            return
+
+        # Find the annotation that contains this position in this widget
+        seg = self.data["segments"][self.current_index]
+        for ann in seg.get("error_annotations", []):
+            if ann['category'] != cat_tag:
+                continue
+            # Determine if this widget and position match
+            if widget == self.gold_text:
+                start = ann['gold_start']
+                end = ann['gold_end']
+            elif widget == self.whisper_text and ann['model'] == 'whisper':
+                start = ann['model_start']
+                end = ann['model_end']
+            elif widget == self.qwen_text and ann['model'] == 'qwen':
+                start = ann['model_start']
+                end = ann['model_end']
+            else:
+                continue
+
+            if widget.compare(index, ">=", start) and widget.compare(index, "<=", end):
+                # Found the annotation – if it's different from current hover, update
+                if self.current_hover_annotation != ann:
+                    self._clear_hover()
+                    self._apply_hover(ann)
+                    self.current_hover_annotation = ann
+                return
+
+        # If we get here, no matching annotation found
+        self._clear_hover()
+
+    def _clear_hover(self):
+        for w in (self.whisper_text, self.qwen_text, self.gold_text):
+            w.tag_remove("hover", "1.0", tk.END)
+        self.current_hover_annotation = None
+
+    def _apply_hover(self, ann):
+        # Apply hover tag to model span
+        if ann['model'] == 'whisper':
+            self.whisper_text.tag_add("hover", ann['model_start'], ann['model_end'])
+        else:
+            self.qwen_text.tag_add("hover", ann['model_start'], ann['model_end'])
+        # Apply hover tag to gold span
+        self.gold_text.tag_add("hover", ann['gold_start'], ann['gold_end'])
+
+    # ------------------------------------------------------------
+    # Remove annotation
+    # ------------------------------------------------------------
+    def remove_annotation(self):
+        seg = self.data["segments"][self.current_index]
+        annotations = seg.get("error_annotations", [])
+        if not annotations:
+            return
+
+        # Check each widget for cursor position
+        for widget in (self.whisper_text, self.qwen_text, self.gold_text):
+            try:
+                cursor = widget.index(tk.INSERT)
+            except:
+                continue
+            for ann in annotations:
+                # Determine if cursor is inside this annotation in this widget
+                if widget == self.gold_text:
+                    start = ann['gold_start']
+                    end = ann['gold_end']
+                elif widget == self.whisper_text and ann['model'] == 'whisper':
+                    start = ann['model_start']
+                    end = ann['model_end']
+                elif widget == self.qwen_text and ann['model'] == 'qwen':
+                    start = ann['model_start']
+                    end = ann['model_end']
+                else:
+                    continue
+
+                if widget.compare(cursor, ">=", start) and widget.compare(cursor, "<=", end):
+                    # Found it – remove this annotation
+                    cat = ann['category']
+                    self.gold_text.tag_remove(cat, ann['gold_start'], ann['gold_end'])
+                    if ann['model'] == 'whisper':
+                        self.whisper_text.tag_remove(cat, ann['model_start'], ann['model_end'])
+                    else:
+                        self.qwen_text.tag_remove(cat, ann['model_start'], ann['model_end'])
+
+                    annotations.remove(ann)
+                    seg["error_annotations"] = annotations
+                    seg["error_counts"][cat] = max(0, seg["error_counts"].get(cat, 0) - 1)
+
+                    # Update count label
+                    self.count_labels[cat].config(text=f"{cat[:15]}: {seg['error_counts'][cat]}")
+                    self.status_label.config(text="Annotation removed", fg="orange")
+                    self.root.after(2000, lambda: self.status_label.config(text=""))
+                    self._clear_hover()  # remove any lingering hover
+                    return
+
+        messagebox.showinfo("No Annotation", "No annotation found at cursor position.")
+
+    # ------------------------------------------------------------
+    # Load / save / navigation
+    # ------------------------------------------------------------
+    def load_segment(self):
+        seg = self.data["segments"][self.current_index]
+
+        # Gold text (NORMAL, selectable, non-editable)
+        self.gold_text.config(state=tk.NORMAL)
+        self.gold_text.delete("1.0", tk.END)
+        self.gold_text.insert("1.0", seg.get("text", ""))
+        for cat, _ in self.STYLES:
+            self.gold_text.tag_remove(cat, "1.0", tk.END)
+        # Keep state NORMAL for selection
+
+        # Whisper text (NORMAL, selectable, non-editable)
+        whisper_txt = seg.get("whisper_text", "")
+        self.whisper_text.config(state=tk.NORMAL)
+        self.whisper_text.delete("1.0", tk.END)
+        self.whisper_text.insert("1.0", whisper_txt)
+        for cat, _ in self.STYLES:
+            self.whisper_text.tag_remove(cat, "1.0", tk.END)
+        # Keep state NORMAL
+
+        # Qwen text (NORMAL, selectable, non-editable)
+        qwen_txt = seg.get("qwen_text", "")
+        self.qwen_text.config(state=tk.NORMAL)
+        self.qwen_text.delete("1.0", tk.END)
+        self.qwen_text.insert("1.0", qwen_txt)
+        for cat, _ in self.STYLES:
+            self.qwen_text.tag_remove(cat, "1.0", tk.END)
+        # Keep state NORMAL
+
+        # Apply stored annotations
+        annotations = seg.get("error_annotations", [])
+        for ann in annotations:
+            cat = ann['category']
+            # Gold
+            self.gold_text.tag_add(cat, ann['gold_start'], ann['gold_end'])
+            # Model
+            if ann['model'] == 'whisper':
+                self.whisper_text.tag_add(cat, ann['model_start'], ann['model_end'])
+            else:
+                self.qwen_text.tag_add(cat, ann['model_start'], ann['model_end'])
+
+        # Update count labels
+        counts = seg.get("error_counts", {})
+        for cat in self.CATEGORIES:
+            self.count_labels[cat].config(text=f"{cat[:15]}: {counts.get(cat, 0)}")
+
+        # Update segment index label
+        total = len(self.data["segments"])
+        self.lbl_idx.config(text=f"Segment {self.current_index+1}/{total}")
+
+        self.clear_pending()
+        self._clear_hover()
+
+    def save_transcript(self):
+        with open(self.transcript_path, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        self.project_manager.transcripts[str(self.video_dir)] = self.data
+        self.status_label.config(text="✓ Saved", fg="green")
+        self.root.after(2000, lambda: self.status_label.config(text=""))
+
+    def next_segment(self):
+        if self.current_index < len(self.data["segments"]) - 1:
+            self.current_index += 1
+            self.load_segment()
+
+    def prev_segment(self):
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.load_segment()
+
+    def on_close(self):
+        self.save_transcript()
+        self.root.destroy()
+
+# -------------------------
+# Main Browser Window (updated)
 # -------------------------
 class TranscriptionBrowser:
-    # ... (unchanged, same as before) ...
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Bahasa Rojak Transcription Browser")
@@ -806,6 +1296,7 @@ class TranscriptionBrowser:
         # Initialize project manager
         self.project_manager = ProjectManager()
         self.current_corrector = None
+        self.current_error_classifier = None
         
         self.setup_ui()
         self.refresh_lists()
@@ -816,7 +1307,7 @@ class TranscriptionBrowser:
         header_frame.pack(fill="x")
         header_frame.pack_propagate(False)
         
-        title = tk.Label(header_frame, text="🎤 Bahasa Rojak Transcription Corrector", 
+        title = tk.Label(header_frame, text="🎤 Bahasa Rojak Transcription Tools", 
                         font=("Arial", 16, "bold"), fg="white", bg="#2c3e50")
         title.pack(side="left", padx=20, pady=10)
         
@@ -865,7 +1356,6 @@ class TranscriptionBrowser:
         hsb = ttk.Scrollbar(tree_container, orient="horizontal", command=self.video_tree.xview)
         self.video_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         
-        # Now grid INSIDE tree_container
         self.video_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
@@ -879,73 +1369,66 @@ class TranscriptionBrowser:
         right_frame = tk.LabelFrame(main_frame, text="Actions", padx=10, pady=10)
         right_frame.pack(side="right", fill="y", padx=(5, 0))
         
-        # Action buttons
-        btn_open = tk.Button(right_frame, text="📝 Open Selected", command=self.open_selected_video, 
-                           width=20, height=2, bg="#3498db", fg="white", font=("Arial", 10, "bold"))
-        btn_open.pack(pady=5)
+        # Annotation GUI button
+        btn_open_annot = tk.Button(right_frame, text="📝 Open Annotation GUI", 
+                                    command=self.open_annotation_gui, 
+                                    width=25, height=2, bg="#3498db", fg="white", font=("Arial", 10, "bold"))
+        btn_open_annot.pack(pady=5)
+        
+        # Error Classification GUI button
+        btn_open_error = tk.Button(right_frame, text="❌ Open Error Classification GUI", 
+                                    command=self.open_error_gui, 
+                                    width=25, height=2, bg="#e67e22", fg="white", font=("Arial", 10, "bold"))
+        btn_open_error.pack(pady=5)
         
         btn_refresh = tk.Button(right_frame, text="🔄 Refresh List", command=self.refresh_lists,
-                              width=20, height=2)
+                              width=25, height=2)
         btn_refresh.pack(pady=5)
         
         btn_export = tk.Button(right_frame, text="📊 Export Progress", command=self.export_progress,
-                             width=20, height=2, bg="#27ae60", fg="white")
+                             width=25, height=2, bg="#27ae60", fg="white")
         btn_export.pack(pady=5)
         
         btn_save_all = tk.Button(right_frame, text="💾 Save All", command=self.save_all_transcripts,
-                               width=20, height=2, bg="#e74c3c", fg="white")
+                               width=25, height=2, bg="#e74c3c", fg="white")
         btn_save_all.pack(pady=5)
         
-        # Mark all as verified button
         btn_mark_all = tk.Button(right_frame, text="✓ Mark All as Verified", command=self.mark_all_verified,
-                               width=20, height=2, bg="#f39c12", fg="white")
+                               width=25, height=2, bg="#f39c12", fg="white")
         btn_mark_all.pack(pady=5)
         
         # Statistics frame
         stats_frame = tk.LabelFrame(right_frame, text="Statistics", padx=10, pady=10)
         stats_frame.pack(fill="x", pady=20)
         
-        self.stats_text = tk.Text(stats_frame, height=8, width=25, font=("Arial", 9))
+        self.stats_text = tk.Text(stats_frame, height=8, width=30, font=("Arial", 9))
         self.stats_text.pack(fill="both")
         self.stats_text.config(state=tk.DISABLED)
         
         # Progress bar
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(right_frame, variable=self.progress_var, length=200)
+        self.progress_bar = ttk.Progressbar(right_frame, variable=self.progress_var, length=250)
         self.progress_bar.pack(pady=10)
         
         self.progress_label = tk.Label(right_frame, text="0% complete", font=("Arial", 9))
         self.progress_label.pack()
     
     def refresh_lists(self):
-        """Refresh the channel and video lists"""
-        # Clear lists
         self.channel_listbox.delete(0, tk.END)
         self.video_tree.delete(*self.video_tree.get_children())
-        
-        # Reload project data
         self.project_manager.load_project()
-        
-        # Populate channels
         for channel in sorted(self.project_manager.channels, key=lambda x: x.name):
             self.channel_listbox.insert(tk.END, channel.name)
-        
-        # Update statistics
         self.update_statistics()
-        
         self.status_bar.config(text=f"Loaded {len(self.project_manager.channels)} channels")
     
     def update_statistics(self):
-        """Update statistics display"""
         total_videos = sum(len(videos) for videos in self.project_manager.videos.values())
-
-        # Calculate statistics
         verified_videos = 0
         whisper_videos = 0
         empty_videos = 0
         total_segments = 0
         verified_segments = 0
-
         for status in self.project_manager.status_tracker.values():
             if status["verified"]:
                 verified_videos += 1
@@ -955,8 +1438,6 @@ class TranscriptionBrowser:
                 empty_videos += 1
             verified_segments += status["segments_verified"]
             total_segments += status["total_segments"]
-
-        # Update progress (based on verified segments)
         if total_segments > 0:
             progress = (verified_segments / total_segments) * 100
             self.progress_var.set(progress)
@@ -964,11 +1445,8 @@ class TranscriptionBrowser:
         else:
             self.progress_var.set(0)
             self.progress_label.config(text="0% verified")
-
-        # Update stats text with clearer categories
         self.stats_text.config(state=tk.NORMAL)
         self.stats_text.delete(1.0, tk.END)
-
         stats = f"""📊 Project Statistics
     ────────────────
     Channels: {len(self.project_manager.channels)}
@@ -980,167 +1458,137 @@ class TranscriptionBrowser:
     Total Segments: {total_segments}
     ✓ Verified Segments: {verified_segments}
     ○ Pending Segments: {total_segments - verified_segments}"""
-
         self.stats_text.insert(1.0, stats)
         self.stats_text.config(state=tk.DISABLED)
     
     def on_channel_select(self, event):
-        """Handle channel selection"""
         selection = self.channel_listbox.curselection()
         if not selection:
             return
-        
         channel_name = self.channel_listbox.get(selection[0])
         self.populate_videos(channel_name)
     
     def populate_videos(self, channel_name):
-        """Populate videos for selected channel"""
-        # Clear video tree
         self.video_tree.delete(*self.video_tree.get_children())
-        
-        # Get videos for this channel
         video_dirs = self.project_manager.videos.get(channel_name, [])
-        
         for video_dir in sorted(video_dirs, key=lambda x: x.name):
             status = self.project_manager.get_video_info(video_dir)
-            
-            # Determine icon/color based on status
             if "✓ Verified" in status:
                 tag = "verified"
             elif "Whisper Generated" in status:
                 tag = "whisper"
             else:
                 tag = "empty"
-            
-            # Insert into tree
-            item = self.video_tree.insert("", "end", text=video_dir.name, 
-                                         values=(status,), tags=(tag,))
-        
-        # Configure tags for coloring
+            self.video_tree.insert("", "end", text=video_dir.name, values=(status,), tags=(tag,))
         self.video_tree.tag_configure("verified", foreground="green")
         self.video_tree.tag_configure("whisper", foreground="orange")
         self.video_tree.tag_configure("empty", foreground="gray")
     
     def filter_videos(self, *args):
-        """Filter videos based on search text"""
         search_text = self.search_var.get().lower()
         selection = self.channel_listbox.curselection()
-        
         if not selection:
             return
-        
         channel_name = self.channel_listbox.get(selection[0])
         video_dirs = self.project_manager.videos.get(channel_name, [])
-        
-        # Clear and repopulate with filtered results
         self.video_tree.delete(*self.video_tree.get_children())
-        
         for video_dir in video_dirs:
             if search_text in video_dir.name.lower():
                 status = self.project_manager.get_video_info(video_dir)
-                
-                # Determine tag
                 if "✓ Verified" in status:
                     tag = "verified"
                 elif "Whisper Generated" in status:
                     tag = "whisper"
                 else:
                     tag = "empty"
-                    
-                self.video_tree.insert("", "end", text=video_dir.name, 
-                                      values=(status,), tags=(tag,))
+                self.video_tree.insert("", "end", text=video_dir.name, values=(status,), tags=(tag,))
     
     def get_selected_video(self):
-        """Get the currently selected video"""
         selection = self.video_tree.selection()
         if not selection:
             return None
-        
-        # Get selected channel
         channel_selection = self.channel_listbox.curselection()
         if not channel_selection:
             return None
-        
         channel_name = self.channel_listbox.get(channel_selection[0])
         video_name = self.video_tree.item(selection[0])["text"]
-        
-        # Find the video directory
         for video_dir in self.project_manager.videos[channel_name]:
             if video_dir.name == video_name:
                 return video_dir
-        
         return None
     
-    def open_selected_video(self):
-        """Open the selected video in correction tool"""
+    def open_annotation_gui(self):
         video_dir = self.get_selected_video()
         if not video_dir:
             messagebox.showwarning("No Selection", "Please select a video first.")
             return
-        
         transcript_path = video_dir / "transcript.json"
         if not transcript_path.exists():
             messagebox.showerror("Not Found", f"transcript.json not found in {video_dir}")
             return
-        
-        # Close existing corrector if open
         if self.current_corrector:
             try:
                 self.current_corrector.on_close()
             except:
                 pass
-        
-        # Open new corrector
         self.current_corrector = WaveformCorrector(transcript_path, self.project_manager)
-        self.status_bar.config(text=f"Opened: {video_dir.name}")
+        self.status_bar.config(text=f"Opened annotation: {video_dir.name}")
+    
+    def open_error_gui(self):
+        video_dir = self.get_selected_video()
+        if not video_dir:
+            messagebox.showwarning("No Selection", "Please select a video first.")
+            return
+        transcript_path = video_dir / "transcript.json"
+        if not transcript_path.exists():
+            messagebox.showerror("Not Found", f"transcript.json not found in {video_dir}")
+            return
+        if self.current_error_classifier:
+            try:
+                self.current_error_classifier.on_close()
+            except:
+                pass
+        self.current_error_classifier = ErrorClassificationGUI(transcript_path, self.project_manager)
+        self.status_bar.config(text=f"Opened error classification: {video_dir.name}")
+    
+    def on_video_double_click(self, event):
+        self.open_annotation_gui()
     
     def mark_all_verified(self):
-        """Mark all Whisper-generated videos as verified (for batch processing)"""
         if not messagebox.askyesno("Confirm", "Mark ALL Whisper-generated videos as verified?\n\nThis will change their status but won't modify the actual transcripts."):
             return
-        
         count = 0
         for channel_name, video_dirs in self.project_manager.videos.items():
             for video_dir in video_dirs:
                 if str(video_dir) in self.project_manager.status_tracker:
                     status = self.project_manager.status_tracker[str(video_dir)]
-                    if status["whisper_generated"] and not status["verified"]:
+                    if status.get("whisper_generated", False) and not status["verified"]:
                         self.project_manager.mark_all_verified(video_dir)
                         count += 1
-        
         self.refresh_lists()
         messagebox.showinfo("Complete", f"Marked {count} videos as verified.")
         self.status_bar.config(text=f"Marked {count} videos as verified")
     
-    def on_video_double_click(self, event):
-        """Handle double-click on video item"""
-        self.open_selected_video()
-    
     def export_progress(self):
-        """Export progress report"""
         report_path = self.project_manager.export_progress_report()
         messagebox.showinfo("Export Complete", f"Progress report exported to:\n{report_path}")
         self.status_bar.config(text=f"Exported progress report to {report_path}")
     
     def save_all_transcripts(self):
-        """Save all modified transcripts"""
         saved = self.project_manager.save_all()
         messagebox.showinfo("Save Complete", f"Saved {saved} transcripts.")
         self.refresh_lists()
         self.status_bar.config(text=f"Saved {saved} transcripts")
     
     def run(self):
-        """Start the main application"""
         self.root.mainloop()
 
 # -------------------------
 # Main entry point
 # -------------------------
 if __name__ == "__main__":
-    # Check if preprocess directory exists
     base_dir = Path("Youtube/preprocess")
     if not base_dir.exists():
-        # Ask user to select directory
         selected_dir = filedialog.askdirectory(title="Select preprocess directory")
         if selected_dir:
             base_dir = Path(selected_dir)
@@ -1148,6 +1596,5 @@ if __name__ == "__main__":
             print("No directory selected. Exiting.")
             raise SystemExit(0)
     
-    # Create browser application
     browser = TranscriptionBrowser()
     browser.run()

@@ -206,14 +206,19 @@ class ToolTester:
         abs_video_path = str(video_p.resolve())
         print(f"📂 Original video path: {abs_video_path}")
         
-        # --- THE BRUTE-FORCE COPY TRICK ---
-        # OpenCV sees through symlinks. We physically copy the file to guarantee a clean path.
-        temp_file = Path(f"/tmp/temp_cv2_video{video_p.suffix}")
+        # --- THE FFMPEG RE-INDEX TRICK ---
+        # OpenCV fails on YouTube .webm files with broken indexes, causing premature EOF.
+        # We use FFmpeg to copy the video stream into an MKV container, which rebuilds the index.
+        temp_file = Path("/tmp/temp_cv2_video.mkv")
         if temp_file.exists():
-            temp_file.unlink() # Remove old temp file if it exists
+            temp_file.unlink()
             
-        print(f"⏳ Copying video to a temporary safe location: {temp_file}...")
-        shutil.copy(abs_video_path, temp_file)
+        print(f"⏳ Rebuilding video index into a temporary MKV: {temp_file}...")
+        subprocess.run([
+            "ffmpeg", "-err_detect", "ignore_err", "-i", abs_video_path,
+            "-c:v", "copy", "-an", # Copy video stream instantly, drop audio
+            "-y", str(temp_file), "-loglevel", "error"
+        ])
         
         cap = cv2.VideoCapture(str(temp_file))
         
