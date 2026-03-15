@@ -936,6 +936,11 @@ class ErrorClassificationGUI:
         self.qwen_text.tag_configure("hover", background="yellow", borderwidth=2, relief="solid")
         self.gold_text.tag_configure("hover", background="yellow", borderwidth=2, relief="solid")
 
+        # 👇 ADD THIS: Temporary style for text that is selected but waiting for a pair
+        self.whisper_text.tag_configure("pending", background="#b3d9ff", borderwidth=1, relief="raised")
+        self.qwen_text.tag_configure("pending", background="#b3d9ff", borderwidth=1, relief="raised")
+        self.gold_text.tag_configure("pending", background="#b3d9ff", borderwidth=1, relief="raised")
+
         # Bottom: category buttons and statistics
         bottom_frame = tk.Frame(self.root)
         bottom_frame.pack(fill="x", padx=6, pady=6)
@@ -993,6 +998,29 @@ class ErrorClassificationGUI:
         self.pending_second = None
         self.instruction.config(text="Select a span in Gold, then a span in Whisper/Qwen (or vice versa).")
 
+        # 👇 ADD THIS: Clear the pending visual highlights and reset cursors
+        for w in (self.gold_text, self.whisper_text, self.qwen_text):
+            w.tag_remove("pending", "1.0", tk.END)
+        self.update_cursors()
+
+    def update_cursors(self):
+        """Changes the mouse cursor to guide the user on what to select next."""
+        if self.pending_first is None:
+            # Reset all cursors to normal text selection
+            self.gold_text.config(cursor="xterm")
+            self.whisper_text.config(cursor="xterm")
+            self.qwen_text.config(cursor="xterm")
+        elif self.pending_first['widget'] == 'gold':
+            # Gold is selected. Need Whisper or Qwen next.
+            self.gold_text.config(cursor="X_cursor")  # Show X over Gold
+            self.whisper_text.config(cursor="crosshair") # Show crosshair over targets
+            self.qwen_text.config(cursor="crosshair")
+        else:
+            # Whisper/Qwen is selected. Need Gold next.
+            self.gold_text.config(cursor="crosshair")
+            self.whisper_text.config(cursor="X_cursor")
+            self.qwen_text.config(cursor="X_cursor")
+
     def on_click_gold(self, event):
         pass
 
@@ -1003,15 +1031,24 @@ class ErrorClassificationGUI:
         sel = self.get_selection(self.gold_text)
         if not sel:
             return
+            
         if self.pending_first is None:
             # First selection is gold
             self.pending_first = {'widget': 'gold', 'start': sel[0], 'end': sel[1]}
+            self.gold_text.tag_add("pending", sel[0], sel[1]) # Lock in the visual highlight
             self.instruction.config(text="Now select the corresponding span in Whisper or Qwen.")
+            self.update_cursors() # Change cursors
+            
         elif self.pending_second is None:
             # We already have a first selection; check that it's not gold (should be model)
             if self.pending_first['widget'] != 'gold':
                 self.pending_second = {'widget': 'gold', 'start': sel[0], 'end': sel[1]}
+                self.gold_text.tag_add("pending", sel[0], sel[1])
                 self.instruction.config(text="Ready to assign a category.")
+                # Optional: Reset cursors since both pairs are found
+                self.gold_text.config(cursor="arrow")
+                self.whisper_text.config(cursor="arrow")
+                self.qwen_text.config(cursor="arrow")
             else:
                 # Both selections are gold? Reset
                 self.clear_pending()
@@ -1026,20 +1063,30 @@ class ErrorClassificationGUI:
             model = 'whisper'
         else:
             model = 'qwen'
+            
         sel = self.get_selection(widget)
         if not sel:
             return
+            
         if self.pending_first is None:
             self.pending_first = {'widget': model, 'start': sel[0], 'end': sel[1]}
+            widget.tag_add("pending", sel[0], sel[1]) # Lock in the visual highlight
             self.instruction.config(text="Now select the corresponding span in Gold.")
+            self.update_cursors() # Change cursors
+            
         elif self.pending_second is None:
-            if self.pending_first['widget'] == model:
-                # Same model twice? Reset
+            if self.pending_first['widget'] == model or self.pending_first['widget'] not in ['gold']:
+                # Same model twice or two models? Reset
                 self.clear_pending()
-                self.instruction.config(text="Invalid: both selections are the same model. Start over.")
+                self.instruction.config(text="Invalid: Must pair a Model with Gold. Start over.")
             else:
                 self.pending_second = {'widget': model, 'start': sel[0], 'end': sel[1]}
+                widget.tag_add("pending", sel[0], sel[1])
                 self.instruction.config(text="Ready to assign a category.")
+                # Optional: Reset cursors since both pairs are found
+                self.gold_text.config(cursor="arrow")
+                self.whisper_text.config(cursor="arrow")
+                self.qwen_text.config(cursor="arrow")
         else:
             pass
 
